@@ -37,55 +37,55 @@ export namespace Format {
     Effect.gen(function* () {
       const instance = yield* InstanceContext
 
-      const enabled: Record<string, boolean> = {}
+      const cache: Record<string, string[] | false> = {}
       const formatters: Record<string, Formatter.Info> = {}
 
       const cfg = yield* Effect.promise(() => Config.get())
+
+      if (cfg.formatter === false) {
+        log.info("all formatters are disabled")
+      }
 
       if (cfg.formatter !== false) {
         for (const item of Object.values(Formatter)) {
           formatters[item.name] = item
         }
+
         for (const [name, item] of Object.entries(cfg.formatter ?? {})) {
           if (item.disabled) {
             delete formatters[name]
             continue
           }
-          const info = mergeDeep(formatters[name] ?? {}, {
-            command: [],
+
+          const result: Formatter.Info = mergeDeep(formatters[name] ?? {}, {
             extensions: [],
             ...item,
           })
 
-          if (info.command.length === 0) continue
-
-          formatters[name] = {
-            ...info,
-            name,
-            enabled: async () => true,
-          }
+          result.enabled = async () => item.command ?? false
+          result.name = name
+          formatters[name] = result
         }
-      } else {
-        log.info("all formatters are disabled")
       }
 
-      async function isEnabled(item: Formatter.Info) {
-        let status = enabled[item.name]
-        if (status === undefined) {
-          status = await item.enabled()
-          enabled[item.name] = status
+      async function resolve(item: Formatter.Info) {
+        let command = cache[item.name]
+        if (command === undefined) {
+          log.info("resolving command", { name: item.name })
+          command = await item.enabled()
+          cache[item.name] = command
         }
-        return status
+        return command
       }
 
-      async function getFormatter(ext: string) {
-        const result = []
+      async function get(ext: string) {
+        const result: { info: Formatter.Info; command: string[] }[] = []
         for (const item of Object.values(formatters)) {
-          log.info("checking", { name: item.name, ext })
           if (!item.extensions.includes(ext)) continue
-          if (!(await isEnabled(item))) continue
+          const command = await resolve(item)
+          if (!command) continue
           log.info("enabled", { name: item.name, ext })
-          result.push(item)
+          result.push({ info: item, command })
         }
         return result
       }
@@ -99,30 +99,28 @@ export namespace Format {
               log.info("formatting", { file })
               const ext = path.extname(file)
 
-              for (const item of await getFormatter(ext)) {
-                log.info("running", { command: item.command })
+              for (const { info, command } of await get(ext)) {
+                const replaced = command.map((x) => x.replace("$FILE", file))
+                log.info("running", { replaced })
                 try {
-                  const proc = Process.spawn(
-                    item.command.map((x) => x.replace("$FILE", file)),
-                    {
-                      cwd: instance.directory,
-                      env: { ...process.env, ...item.environment },
-                      stdout: "ignore",
-                      stderr: "ignore",
-                    },
-                  )
+                  const proc = Process.spawn(replaced, {
+                    cwd: instance.directory,
+                    env: { ...process.env, ...info.environment },
+                    stdout: "ignore",
+                    stderr: "ignore",
+                  })
                   const exit = await proc.exited
                   if (exit !== 0) {
                     log.error("failed", {
-                      command: item.command,
-                      ...item.environment,
+                      command,
+                      ...info.environment,
                     })
                   }
                 } catch (error) {
                   log.error("failed to format file", {
                     error,
-                    command: item.command,
-                    ...item.environment,
+                    command,
+                    ...info.environment,
                     file,
                   })
                 }
@@ -137,11 +135,11 @@ export namespace Format {
       const status = Effect.fn("Format.status")(function* () {
         const result: Status[] = []
         for (const formatter of Object.values(formatters)) {
-          const isOn = yield* Effect.promise(() => isEnabled(formatter))
+          const command = yield* Effect.promise(() => resolve(formatter))
           result.push({
             name: formatter.name,
             extensions: formatter.extensions,
-            enabled: isOn,
+            enabled: !!command,
           })
         }
         return result
